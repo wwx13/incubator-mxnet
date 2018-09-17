@@ -1,0 +1,349 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jun 19 14:51:21 2018
+
+# -*- coding: utf-8 -*-
+"""
+"""
+# -*- coding: utf-8 -*-
+"""
+
+
+import mxnet as mx
+from mxnet import autograd as ag, ndarray as nd, gluon,init
+from mxnet.gluon import Block, nn, rnn,utils as gutils,data as gdata
+import mxnet.optimizer as optim
+import sys
+
+
+mx.random.seed(1)
+
+
+f=open("train_data.txt","rb")
+train_senten=''
+save=[]
+save_features=[]
+save_labels=[]
+train_label=''
+for x in f:
+    m=x.decode("utf-8").replace('\t',"").replace("\n","")
+    if m=='':
+        continue
+    if m[0] in ['，','。','、','！','？','”','“','：','；','《','》','【','】']:
+        if train_label!='' and train_senten!='' and len(train_label.split())>1:
+            save.append((train_senten.split(),train_label.split()))
+            save_features.append(train_senten.split())
+            save_labels.append(train_label.split())
+        train_label=''
+        train_senten=''
+    else:
+        train_senten+=" "+m[0]
+        train_label+=" "+m[1:]
+f.close()
+
+def to_scalar(x):
+    return int(x.asscalar())
+
+
+def argmax(vec):
+   idx = nd.argmax(vec, axis=1)
+   return int(idx.asscalar()) 
+
+
+def prepare_sequence(seq, word2idx):
+    return [word2idx[w] for w in seq]
+
+# Compute log sum exp is numerically more stable than multiplying probabilities
+def log_sum_exp(vec):
+    max_score = nd.max(vec,axis=1).reshape((-1,1))
+#    nd.log(nd.sum(nd.exp(vec - max_score),axis=1)
+    return nd.log(nd.sum(nd.exp(vec - max_score),axis=1).reshape((-1,1))) + max_score
+#    return 10+max_score
+# Model
+class CRF(Block):
+    def __init__(self, vocab_size, tag2idx, embedding_dim, hidden_dim):
+        super(CRF, self).__init__()
+        with self.name_scope():
+            self.embedding_dim = embedding_dim
+            self.hidden_dim = hidden_dim
+            self.vocab_size = vocab_size
+            self.tag2idx = tag2idx
+            self.tagset_size = len(tag2idx)
+            self.word_embeds = nn.Embedding(vocab_size, embedding_dim,weight_initializer=init.Uniform(0.1))
+            self.transitions =self.params.get('transitions',shape=(self.tagset_size, self.tagset_size)) 
+
+    def init_trans(self):
+        tr=nd.random.normal(shape=(self.tagset_size,self.tagset_size))
+        tr[tag2idx[START_TAG], :]=-10000
+        tr[:, tag2idx[STOP_TAG]]=-10000
+        return tr
+    def set_trans(self):
+        self.transitions.set_data(self.init_trans())
+    def _forward_alg(self, feats):
+        
+        batch_size=feats.shape[1]
+#        print("dad",batch_size)
+        # Do the forward algorithm to compute the partition function
+        alphas = [[-10000.] * self.tagset_size]*batch_size
+        for m in range(batch_size):
+            alphas[m][self.tag2idx[START_TAG]] = 0.
+        alphas = nd.array(alphas)
+        for feat in feats:
+            tran=self.transitions.data()
+#            tran[:,self.tag2idx[START_TAG]]=-10000
+#            tran[self.tag2idx[STOP_TAG],:]=-10000
+            alphas_t = []  # The forward variables at this timestep
+            for next_tag in range(self.tagset_size):
+#      
+                
+                emit_score = feat.pick(nd.array([next_tag]*batch_size)).reshape((-1, 1))
+
+                trans_score = tran[next_tag].reshape((1, -1))
+
+                next_tag_var = alphas + trans_score + emit_score
+
+                alphas_t.append(log_sum_exp(next_tag_var))
+
+            alphas = nd.concat(*alphas_t, dim=1)
+        terminal_var = alphas + tran[self.tag2idx[STOP_TAG]].reshape((1,-1))
+        alpha = log_sum_exp(terminal_var)
+#        print(alpha,"alpha")
+        return alpha
+    
+    
+    def _score_sentence(self, feats, tags):
+        # Gives the score of a provided tag sequence
+        batch_size=feats.shape[1]
+        score = nd.array([[0]]*batch_size)#[[0], [0], [0], [0], [0], [0], [0], [0], [0], [0]]
+        temp=[]
+        for i in tags:
+            f=nd.concat(nd.array([tag2idx[START_TAG]]),*i,dim=0)
+            temp.append(f)
+        tags=nd.concat(*temp,dim=0).reshape((batch_size,-1))
+
+        for i, feat in enumerate(feats):
+            tran=self.transitions.data()
+            score = score + \
+                tran[tags.pick(nd.array([i+1]*batch_size)), tags.pick(nd.array([i]*batch_size))].reshape((-1,1))+ feat.pick(tags.pick(nd.array([i+1]*batch_size))).reshape((-1,1))
+                #tran [长度为bathsize]    tagspick 和它一样
+        tran=self.transitions.data()
+#        print(score.shape)
+        score = score + tran[self.tag2idx[STOP_TAG],tags.pick(nd.array([int(tags.shape[1]-1)]*batch_size))].reshape((-1,1))
+#        print(score.shape)
+#        time.sleep(50)
+        return score
+    
+
+    def _get_lstm_features(self, sentence):
+        self.hidden = self.init_hidden(batch_size=len(sentence))
+        
+        length = sentence[0].shape[0]
+        res_sen=[]
+        for i in range(length):
+            res_sen.append(sentence[:,i].asnumpy())
+        sentence=nd.array(res_sen)
+#        sentence=sentence.reshape((length,len(sentence)))
+#        print(length)
+        embeds = self.word_embeds(sentence)
+        
+#        print(embeds.shape)
+        embedding = self.dropout(embeds)
+
+        lstm_out, self.hidden = self.lstm(embedding, self.hidden)
+#        print(lstm_out.shape,"***")
+        lstm_out=self.dropout(lstm_out)
+
+        lstm_feats = self.hidden2tag(lstm_out)
+
+        return lstm_feats
+
+        
+    def _viterbi_decode(self, feats):
+        backpointers = []
+        batch_size = feats[0].shape[0]
+        vvars = nd.full((1, self.tagset_size), -10000.)
+        vvars[0, self.tag2idx[START_TAG]] = 0
+        # vvars 形状：(batch_size, tagset_size)
+        vvars = nd.broadcast_axis(vvars, axis=0, size=batch_size)
+
+        for feat in feats:
+            bptrs_t = []
+            viterbivars_t = []
+
+            for next_tag in range(self.tagset_size):
+                next_tag_var = vvars + nd.broadcast_axis(
+                    self.transitions.data()[next_tag].reshape((1, -1)),
+                    axis=0, size=batch_size)
+                # best_tag_id 形状（batch_size, 1)
+                best_tag_id = nd.argmax(next_tag_var, axis=1, keepdims=True)
+                bptrs_t.append(best_tag_id)
+
+                viterbivars_t.append(nd.pick(next_tag_var, best_tag_id, axis=1, keepdims=True))
+            vvars = (nd.concat(* viterbivars_t, dim=1) + feat)
+            # bptrs_t 形状 ：(batch_size, tagset_size)
+            bptrs_t = nd.concat(*bptrs_t, dim=1)
+            backpointers.append(bptrs_t)
+
+        # 转换到 STOP_TAG
+        terminal_var = vvars + self.transitions.data()[self.tag2idx[START_TAG]]
+        best_tag_id = nd.argmax(terminal_var, axis=1)
+        # path_score 形状（batch_size, )
+        path_score = nd.pick(terminal_var, best_tag_id, axis=1)
+
+
+        best_path = [best_tag_id]
+        for bptrs_t in reversed(backpointers):
+            best_tag_id = nd.pick(bptrs_t, best_tag_id, axis=1)
+            best_path.append(best_tag_id)
+        # 移除开始符号
+
+        start = best_path.pop()
+        # 检查start是否为开始符号
+        for i in range(batch_size):
+            assert start[i].asscalar() == self.tag2idx[START_TAG]
+        best_path.reverse()
+
+        # 构建最佳路径的矩阵
+        new_best_path = []
+        for best_tag_id in best_path:
+            best_tag_id = best_tag_id.reshape((-1, 1))
+            new_best_path.append(best_tag_id)
+        best_path_matrix = nd.concat(*new_best_path, dim=1)
+
+        return path_score, best_path_matrix
+    
+    
+    def neg_log_likelihood(self, sentence, tags):
+        length = sentence[0].shape[0]
+        res_sen=[]
+        for i in range(length):
+            res_sen.append(sentence[:,i].asnumpy())
+        sentence=nd.array(res_sen)
+#        sentence=sentence.reshape((length,len(sentence)))
+#        print(length)
+        feats = self.word_embeds(sentence)
+#        print(feats.shape)
+        forward_score = self._forward_alg(feats)
+#         print(forward_score)
+#         time.sleep(10)
+        gold_score = self._score_sentence(feats, tags)
+        return (forward_score-gold_score)
+    
+
+    def forward(self, sentence):  # dont confuse this with _forward_alg above.
+        # Get the emission scores from the BiLSTM
+        length = sentence[0].shape[0]
+        res_sen=[]
+        for i in range(length):
+            res_sen.append(sentence[:,i].asnumpy())
+        sentence=nd.array(res_sen)
+#        sentence=sentence.reshape((length,len(sentence)))
+#        print(length)
+        feats = self.word_embeds(sentence)
+#        print(feats.shape)
+        
+        # Find the best path, given the features.
+        score, tag_seq = self._viterbi_decode(feats)
+        return score, tag_seq
+
+
+
+
+START_TAG = "<START>"
+STOP_TAG = "<STOP>"
+EMBEDDING_DIM = 9
+HIDDEN_DIM = 256
+
+#tag2idx = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4}
+tag2idx = {"B-PER": 0, "I-PER": 1, "B-LOC": 2,"I-LOC": 3,"B-ORG": 4,"I-ORG": 5,"O": 6, START_TAG: 7, STOP_TAG: 8}
+tr_data_dic={}
+for i in range(1,613):
+    if i!=0:
+        tr_data_dic[i]=[m for m in save if len(m[1])==i] 
+word2idx = {}
+for x in tr_data_dic:
+    for sentence, tags in tr_data_dic[x]:
+        if tags!= ['O']*int(x):
+            for word in sentence:
+                if word not in word2idx:
+                    word2idx[word] = len(word2idx) 
+            
+data_tr={}
+for x in tr_data_dic:
+    data_tr[x]=[]
+    for feat in tr_data_dic[x]:
+        if feat[1]!=['O']*int(x):
+            f=prepare_sequence(feat[0],word2idx)
+    #        f=nd.array(f)
+        #    print(f)
+            l=[tag2idx[a] for a in feat[1]]
+    #        l=nd.array(l)
+            data_tr[x].append((f,l))   
+n_tr={}
+n_tr[7]=data_tr[7]
+s            
+
+
+
+
+model = CRF(len(word2idx), tag2idx, EMBEDDING_DIM, HIDDEN_DIM)
+model.initialize(mx.init.Xavier(magnitude=1), ctx=mx.cpu())
+model.set_trans()
+optimizer = gluon.Trainer(model.collect_params(), 'adam', {'learning_rate': 0.1, 'wd': 1e-4})
+
+
+import random
+def data_iter(train_data_dic):
+    for x in train_data_dic:
+        length=len(train_data_dic[x])
+        if length!=0:
+            indices=list(range(length))
+            random.shuffle(indices)
+            temp_batch_size=length//2
+            if temp_batch_size<50:
+                feature_batch=nd.array([train_data_dic[x][p][0] for p in list(range(length))])
+                label_batch=nd.array([train_data_dic[x][p][1] for p in list(range(length))])
+                yield feature_batch,label_batch
+            elif temp_batch_size>50 or temp_batch_size==50:
+                for i in range(0, length, temp_batch_size):
+                    j = indices[i: min(i + temp_batch_size, length)]
+    #                j=[1,2]
+    #                print(nd.array([train_data_dic[x][p][1] for p in j]))
+                    feature_batch=nd.array([train_data_dic[x][p][0] for p in j])
+                    label_batch=nd.array([train_data_dic[x][p][1] for p in j])
+                    if len(label_batch)!=1:
+                        yield feature_batch,label_batch
+            
+
+save_loss=[]
+for epoch in range(200): 
+    epo_sum_loss=0
+#    if epoch>150:
+#        optimizer.set_learning_rate(0.0001)
+    if epoch==0:
+        last_sum=9999999
+    count=0
+    for sentence, tags in data_iter(n_tr):
+        count+=1
+
+        with ag.record():
+           neg_log_likelihood = model.neg_log_likelihood(sentence, tags)
+           loss=neg_log_likelihood    
+        loss.backward()
+        epo_sum_loss+=loss.sum().asscalar()
+        grads=[p.grad(ctx=mx.cpu()) for p in model.collect_params().values()]
+        gutils.clip_global_norm(grads,200)
+        optimizer.step(len(sentence))
+    print("epoch",epoch,":","总损失 ",epo_sum_loss/len(n_tr[7]))
+    if epo_sum_loss/len(n_tr[7])<0.6:
+        break
+
+    last_sum=epo_sum_loss
+    save_loss.append(epo_sum_loss)
+
+
+
+
+
+
+
